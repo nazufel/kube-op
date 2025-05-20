@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -80,6 +81,88 @@ func GetNodeVersions(clientset *kubernetes.Clientset) (string, error) {
 	return strings.Join(versions, ", "), nil
 }
 
+// GetExposedEndpoints lists services of type LoadBalancer, NodePort, and Ingresses.
+func GetExposedEndpoints(clientset *kubernetes.Clientset) ([]string, error) {
+	var endpoints []string
+
+	// List Services
+	services, err := clientset.CoreV1().Services("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list services: %w", err)
+	}
+
+	for _, svc := range services.Items {
+		switch svc.Spec.Type {
+		case corev1.ServiceTypeLoadBalancer:
+			var lbIPs []string
+			for _, ingress := range svc.Status.LoadBalancer.Ingress {
+				if ingress.IP != "" {
+					lbIPs = append(lbIPs, ingress.IP)
+				} else if ingress.Hostname != "" {
+					lbIPs = append(lbIPs, ingress.Hostname) // For ELBs that return DNS names
+				}
+			}
+			var portStrings []string
+			for _, port := range svc.Spec.Ports {
+				portStrings = append(portStrings, fmt.Sprintf("%d/%s", port.Port, port.Protocol))
+			}
+			if len(lbIPs) > 0 {
+				endpoint := fmt.Sprintf("Service (LoadBalancer): %s/%s - External Endpoint(s): [%s], Port(s): [%s]",
+					svc.Namespace, svc.Name, strings.Join(lbIPs, ", "), strings.Join(portStrings, ", "))
+				endpoints = append(endpoints, endpoint)
+			}
+		case corev1.ServiceTypeNodePort:
+			var portStrings []string
+			for _, port := range svc.Spec.Ports {
+				portStrings = append(portStrings, fmt.Sprintf("%d:%d/%s", port.Port, port.NodePort, port.Protocol))
+			}
+			endpoint := fmt.Sprintf("Service (NodePort): %s/%s - NodePort(s): [%s] (exposed on all node IPs)",
+				svc.Namespace, svc.Name, strings.Join(portStrings, ", "))
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+
+	// List Ingresses
+	ingresses, err := clientset.NetworkingV1().Ingresses("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list ingresses: %w", err)
+	}
+
+	for _, ing := range ingresses.Items {
+		for _, rule := range ing.Spec.Rules {
+			host := rule.Host
+			if host == "" {
+				host = "*" // Default host if not specified
+			}
+			if rule.HTTP != nil {
+				for _, path := range rule.HTTP.Paths {
+					backend := fmt.Sprintf("%s:%d", path.Backend.Service.Name, path.Backend.Service.Port.Number)
+					// Some ingress controllers might populate status with load balancer IPs/hostnames
+					var ingStatusIPs []string
+					for _, lbIngress := range ing.Status.LoadBalancer.Ingress {
+						if lbIngress.IP != "" {
+							ingStatusIPs = append(ingStatusIPs, lbIngress.IP)
+						} else if lbIngress.Hostname != "" {
+							ingStatusIPs = append(ingStatusIPs, lbIngress.Hostname)
+						}
+					}
+					var endpoint string
+					if len(ingStatusIPs) > 0 {
+						endpoint = fmt.Sprintf("Ingress: %s/%s - Host: %s, Path: %s -> %s, External Endpoint(s): [%s]",
+							ing.Namespace, ing.Name, host, path.Path, backend, strings.Join(ingStatusIPs, ", "))
+					} else {
+						endpoint = fmt.Sprintf("Ingress: %s/%s - Host: %s, Path: %s -> %s",
+							ing.Namespace, ing.Name, host, path.Path, backend)
+					}
+					endpoints = append(endpoints, endpoint)
+				}
+			}
+		}
+	}
+
+	return endpoints, nil
+}
+
 func main() {
 	fmt.Println("Attempting to connect to Kubernetes cluster...")
 
@@ -109,5 +192,19 @@ func main() {
 		fmt.Printf("Could not get node versions: %v\n", err)
 	} else {
 		fmt.Printf("Detected node versions: %s\n", nodeVersions)
+	}
+
+	exposedEndpoints, err := GetExposedEndpoints(clientset)
+	if err != nil {
+		fmt.Printf("Could not get exposed endpoints: %v\n", err)
+	} else {
+		fmt.Println("Detected Exposed Endpoints:")
+		if len(exposedEndpoints) == 0 {
+			fmt.Println("  No exposed LoadBalancer, NodePort services, or Ingresses found.")
+		} else {
+			for _, endpoint := range exposedEndpoints {
+				fmt.Printf("  - %s\n", endpoint)
+			}
+		}
 	}
 }
