@@ -18,3 +18,4 @@
 * come up wth a better name
 * write exploitability algorithm
 * write remediation algorithm
+* figure out license. FOSS for sure, but not sure if GP:, APL, source available, or just MIT
